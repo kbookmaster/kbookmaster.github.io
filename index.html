@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>KBook | Notes from a Failed Monk</title>
   <meta name="description" content="KBook: a former monk in Seoul, preparing a small independent bookshop and writing essays in English.">
+  <link rel="stylesheet" href="chat/chat.css">
   <style>
     :root {
       --paper: #f5efe3;
@@ -271,12 +272,20 @@
     <footer>Seoul, between books.</footer>
   </main>
 
+  <script src="chat/config.js"></script>
+  <script src="chat/common.js"></script>
+  <script src="chat/knock.js"></script>
   <script>
     (function () {
       var btn = document.getElementById('message-btn');
       var notice = document.getElementById('notice');
       var timer;
       btn.addEventListener('click', function () {
+        // 채팅 서버가 준비되면 노크 창을 연다. 아직이면 예전처럼 안내만 띄운다.
+        if (window.KChatKnock && window.KChatKnock.enabled()) {
+          window.KChatKnock.open();
+          return;
+        }
         notice.textContent = 'Messages are coming soon. For now, my essays are the best way to say hello.';
         notice.classList.add('show');
         clearTimeout(timer);

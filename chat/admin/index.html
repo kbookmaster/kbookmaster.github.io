@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>채팅 관리</title>
+  <link rel="stylesheet" href="../chat.css">
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+    .page { max-width: 760px; margin: 0 auto; padding: 0 16px 60px; }
+    .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 18px 0 10px; border-bottom: 1px solid var(--line); }
+    .top h1 { margin: 0; font-family: var(--serif); font-size: 22px; font-weight: 500; }
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 14px 0 18px; }
+    .tab { border: 1px solid var(--line); background: var(--card); color: var(--ink-soft); border-radius: 999px; padding: 6px 14px; font: inherit; cursor: pointer; }
+    .tab[aria-selected="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .badge { display: inline-block; min-width: 20px; padding: 0 6px; margin-left: 4px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 12px; text-align: center; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; margin-bottom: 12px; }
+    .card h3 { margin: 0; font-size: 17px; }
+    .muted { color: var(--ink-faint); font-size: 13px; }
+    .row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .letter { white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0 4px; font-family: var(--serif); font-size: 16px; }
+    .conv-item { cursor: pointer; }
+    .conv-item:hover { border-color: var(--ink-faint); }
+    .snippet { color: var(--ink-soft); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tag { display: inline-block; margin-left: 6px; padding: 0 8px; border-radius: 999px; background: var(--paper-deep); color: var(--ink-soft); font-size: 12px; }
+    .linkbox { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+    .linkbox input { flex: 1; font-size: 13px; padding: 6px 10px; }
+    .detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+    .detail-head h2 { margin: 0; font-family: var(--serif); font-weight: 500; font-size: 22px; }
+    .kc-thread { margin: 18px 0; }
+    .kc-bubble { font-family: var(--serif); }
+    .composer { position: sticky; bottom: 0; background: var(--paper); padding: 10px 0; border-top: 1px solid var(--line); }
+    .login { max-width: 360px; margin: 60px auto; }
+    .empty { color: var(--ink-faint); padding: 18px 0; }
+    .grid2 { display: grid; gap: 0 12px; grid-template-columns: 1fr; }
+    @media (min-width: 560px) { .grid2 { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="top">
+      <h1>채팅 관리</h1>
+      <button type="button" class="kc-btn quiet small kc-hidden" id="logout">로그아웃</button>
+    </div>
+    <section id="view"></section>
+  </main>
+
+  <script src="../config.js"></script>
+  <script src="../common.js"></script>
+  <script>
+  (function () {
+    var K = window.KChat;
+    var el = K.el;
+    var view = document.getElementById('view');
+    var logoutBtn = document.getElementById('logout');
+    var token = K.store.get(K.KEYS.adminToken) || '';
+    var tab = 'knocks';
+    var data = null;
+    var openConvId = null;
+    var conv = null;
+    var openOriginals = {};
+    var editingId = null;
+    var replyDrafts = {};
+    var composeDraft = '';
+    var pollTimer = null;
+    var created = null;
+    var tgInfo = null;
+
+    var ERRORS = {
+      wrong_password: '비밀번호가 맞지 않아요.',
+      locked: '여러 번 틀려서 잠겼어요. 15분 뒤에 다시 해보세요.',
+      turnstile_missing: '사람 확인 상자를 먼저 끝내주세요.',
+      turnstile_failed: '사람 확인에 실패했어요. 다시 해보세요.',
+      admin_password_not_set: '서버에 관리자 비밀번호가 아직 없어요. Cloudflare 비밀 보관함에 ADMIN_PASSWORD를 넣어주세요.',
+      turnstile_not_configured: '서버에 Turnstile 비밀 키가 아직 없어요.',
+      message_too_long: '1,000자까지 쓸 수 있어요.',
+      empty_message: '빈 메시지는 보낼 수 없어요.',
+      revoked: '링크가 폐기된 대화라 보낼 수 없어요.',
+      already_invited: '이미 초대한 노크예요.',
+      passcode_length: '입장 암호는 4자에서 32자 사이로 해주세요.',
+      name_required: '이름을 적어주세요.',
+      name_too_long: '이름은 40자까지예요.',
+      telegram_token_not_set: '서버에 TELEGRAM_BOT_TOKEN이 아직 없어요.'
+    };
+    function errText(err) {
+      return ERRORS[err.code] || ('문제가 생겼어요 (' + (err.code || err.message) + ').');
+    }
+
+    function auth() { return { Authorization: 'Bearer ' + token }; }
+
+    function call(method, path, body) {
+      return K.api(method, path, { headers: auth(), body: body }).catch(function (err) {
+        if (err.status === 401 && err.code === 'login_required') {
+          token = '';
+          K.store.remove(K.KEYS.adminToken);
+          showLogin();
+        }
+        throw err;
+      });
+    }
+
+    function langName(code) {
+      if (!code) return '언어 미정';
+      try { return new Intl.DisplayNames(['ko'], { type: 'language' }).of(code) + ' (' + code + ')'; } catch (e) { return code; }
+    }
+
+    function time(ms) { return K.formatTime(ms, 'ko-KR'); }
+
+    function copyButton(text) {
+      return el('button', {
+        type: 'button', class: 'kc-btn quiet small', text: '복사',
+        onclick: function (e) {
+          var b = e.currentTarget;
+          (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(function () {
+            b.textContent = '복사됨';
+            setTimeout(function () { b.textContent = '복사'; }, 1500);
+          }).catch(function () { prompt('이 링크를 복사하세요', text); });
+        }
+      });
+    }
+
+    function linkBox(link) {
+      var input = el('input', { class: 'kc-input', type: 'text', readonly: true, value: link, 'aria-label': '초대 링크', onfocus: function (e) { e.target.select(); } });
+      return el('div', { class: 'linkbox' }, [input, copyButton(link)]);
+    }
+
+    // ---------- 로그인 ----------
+
+    function showLogin(msg) {
+      stopPolling();
+      logoutBtn.classList.add('kc-hidden');
+      var pass = el('input', { class: 'kc-input', id: 'pw', type: 'password', autocomplete: 'current-password' });
+      var box = el('div', { class: 'kc-turnstile' });
+      var error = el('p', { class: 'kc-error', role: 'alert', text: msg || '' });
+      var btn = el('button', { class: 'kc-btn', type: 'submit', text: '로그인' });
+      var turnstile = null;
+      var form = el('form', { class: 'login' }, [
+        el('label', { class: 'kc-label', for: 'pw', text: '관리자 비밀번호' }), pass, box, error,
+        el('div', { class: 'kc-actions' }, [btn])
+      ]);
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        btn.disabled = true;
+        error.textContent = '';
+        K.api('POST', '/api/admin/login', { body: { password: pass.value, turnstileToken: turnstile ? turnstile.getToken() : '' } })
+          .then(function (d) {
+            token = d.token;
+            K.store.set(K.KEYS.adminToken, token);
+            refresh();
+          })
+          .catch(function (err) {
+            btn.disabled = false;
+            if (turnstile) turnstile.reset();
+            var t = errText(err);
+            if (err.code === 'wrong_password' && err.data && err.data.attemptsLeft !== undefined) t += ' 남은 기회: ' + err.data.attemptsLeft + '번';
+            error.textContent = t;
+          });
+      });
+      view.innerHTML = '';
+      view.appendChild(form);
+      pass.focus();
+      K.mountTurnstile(box).then(function (t) { turnstile = t; }).catch(function () { error.textContent = '사람 확인 상자를 불러오지 못했어요. 새로고침해 보세요.'; });
+    }
+
+    logoutBtn.addEventListener('click', function () {
+      call('POST', '/api/admin/logout').catch(function () {}).then(function () {
+        token = '';
+        K.store.remove(K.KEYS.adminToken);
+        showLogin('로그아웃했어요.');
+      });
+    });
+
+    // ---------- 목록 ----------
+
+    function tabs() {
+      var unread = data.conversations.reduce(function (n, c) { return n + (c.unread ? 1 : 0); }, 0);
+      function t(id, label, count) {
+        return el('button', {
+          type: 'button', class: 'tab', role: 'tab', 'aria-selected': tab === id ? 'true' : 'false',
+          onclick: function () { tab = id; openConvId = null; conv = null; render(); }
+        }, [label, count ? el('span', { class: 'badge', text: String(count) }) : null]);
+      }
+      return el('div', { class: 'tabs', role: 'tablist' }, [
+        t('knocks', '노크', data.knocks.length),
+        t('convs', '대화방', unread),
+        t('new', '새 초대장'),
+        t('telegram', '텔레그램' + (data.telegramConnected ? ' ✓' : ''))
+      ]);
+    }
+
+    function knockCard(k) {
+      var area = el('textarea', { class: 'kc-input', rows: '3', placeholder: '첫 답장 (선택, 한국어로)', 'aria-label': k.name + ' 님에게 첫 답장' });
+      area.value = replyDrafts[k.id] || '';
+      area.addEventListener('input', function () { replyDrafts[k.id] = area.value; });
+      var error = el('p', { class: 'kc-error', role: 'alert' });
+      var invite = el('button', { type: 'button', class: 'kc-btn small', text: '초대하기' });
+      invite.addEventListener('click', function () {
+        invite.disabled = true;
+        call('POST', '/api/admin/knocks/' + k.id + '/invite', { reply: area.value.trim() })
+          .then(function (c) {
+            delete replyDrafts[k.id];
+            created = { name: c.name, link: c.link, fromKnock: true };
+            tab = 'new';
+            refresh();
+          })
+          .catch(function (err) { invite.disabled = false; error.textContent = errText(err); });
+      });
+      var dismiss = el('button', {
+        type: 'button', class: 'kc-btn danger small', text: '지우기',
+        onclick: function () {
+          if (!confirm(k.name + ' 님의 노크를 지울까요? 내용이 지워지고, 그 사람에게는 계속 "기다리는 중"으로 보여요.')) return;
+          call('DELETE', '/api/admin/knocks/' + k.id).then(refresh).catch(function (err) { error.textContent = errText(err); });
+        }
+      });
+      var showOrig = !!openOriginals['k' + k.id];
+      var translated = k.translation && k.translation !== k.letter;
+      return el('article', { class: 'card' }, [
+        el('div', { class: 'row' }, [el('h3', { text: k.name }), el('span', { class: 'muted', text: langName(k.lang) + ' · ' + time(k.at) })]),
+        el('div', { class: 'letter', text: k.translation || k.letter }),
+        k.translation ? null : el('div', { class: 'muted', text: k.trStatus === 'failed' ? '번역 실패, 원문입니다' : '번역 중…' }),
+        translated && showOrig ? el('div', { class: 'kc-original', text: k.letter }) : null,
+        translated ? el('button', { type: 'button', class: 'kc-link', text: showOrig ? '원문 닫기' : 'Original', onclick: function () { openOriginals['k' + k.id] = !showOrig; render(); } }) : null,
+        el('div', { style: 'margin-top:12px' }, [area]),
+        error,
+        el('div', { class: 'kc-actions' }, [invite, dismiss])
+      ]);
+    }
+
+    function knocksView() {
+      if (!data.knocks.length) return el('p', { class: 'empty', text: '새 노크가 없어요.' });
+      return el('div', {}, data.knocks.map(knockCard));
+    }
+
+    function convsView() {
+      if (!data.conversations.length) return el('p', { class: 'empty', text: '아직 대화방이 없어요. 노크에 초대하거나 새 초대장을 만들어 보세요.' });
+      return el('div', {}, data.conversations.map(function (c) {
+        return el('article', {
+          class: 'card conv-item', tabindex: '0', role: 'button',
+          onclick: function () { openConversation(c.id); },
+          onkeydown: function (e) { if (e.key === 'Enter') openConversation(c.id); }
+        }, [
+          el('div', { class: 'row' }, [
+            el('h3', {}, [c.name, c.unread ? el('span', { class: 'badge', text: '새 ' + c.unread }) : null,
+              c.revoked ? el('span', { class: 'tag', text: '폐기됨' }) : null,
+              c.hasPasscode ? el('span', { class: 'tag', text: '암호' }) : null]),
+            el('span', { class: 'muted', text: time(c.lastActivityAt) })
+          ]),
+          el('div', { class: 'muted', text: langName(c.lang) + ' · 상대 남은 메시지 ' + c.remaining + '개' }),
+          c.snippet ? el('div', { class: 'snippet', text: (c.lastFrom === 'owner' ? '나: ' : '') + c.snippet }) : null
+        ]);
+      }));
+    }
+
+    function newView() {
+      var parts = [];
+      if (created) {
+        parts.push(el('div', { class: 'card' }, [
+          el('h3', { text: created.name + ' 님 초대장이 만들어졌어요' }),
+          el('p', { class: 'muted', text: created.fromKnock
+            ? '노크한 브라우저에서 자동으로 대화방이 열려요. 다른 기기에서 쓰고 싶어 하면 이 링크를 보내주세요.'
+            : '이 링크를 상대에게 보내주세요. 링크가 곧 열쇠예요.' + (created.passcode ? ' 입장 암호 "' + created.passcode + '"도 따로 알려주세요.' : '') }),
+          linkBox(created.link)
+        ]));
+      }
+      var name = el('input', { class: 'kc-input', id: 'n-name', type: 'text', maxlength: '40' });
+      var lang = el('input', { class: 'kc-input', id: 'n-lang', type: 'text', placeholder: '예: en, es, ja (비워도 돼요)' });
+      var pass = el('input', { class: 'kc-input', id: 'n-pass', type: 'text', autocomplete: 'off', placeholder: '비워두면 암호 없음' });
+      var error = el('p', { class: 'kc-error', role: 'alert' });
+      var btn = el('button', { type: 'submit', class: 'kc-btn', text: '초대장 만들기' });
+      var form = el('form', { class: 'card' }, [
+        el('h3', { text: '노크 없이 직접 초대하기' }),
+        el('p', { class: 'muted', text: '다른 곳에서 만난 사람에게 보낼 링크를 만들어요.' }),
+        el('label', { class: 'kc-label', for: 'n-name', text: '이름 (내가 알아볼 이름)' }), name,
+        el('div', { class: 'grid2' }, [
+          el('div', {}, [el('label', { class: 'kc-label', for: 'n-lang', text: '상대 언어 (선택)' }), lang]),
+          el('div', {}, [el('label', { class: 'kc-label', for: 'n-pass', text: '입장 암호 (선택)' }), pass])
+        ]),
+        error,
+        el('div', { class: 'kc-actions' }, [btn])
+      ]);
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        btn.disabled = true;
+        var passcode = pass.value.trim();
+        call('POST', '/api/admin/conversations', { name: name.value, lang: lang.value.trim(), passcode: passcode })
+          .then(function (c) { created = { name: c.name, link: c.link, passcode: passcode }; refresh(); })
+          .catch(function (err) { btn.disabled = false; error.textContent = errText(err); });
+      });
+      parts.push(form);
+      return el('div', {}, parts);
+    }
+
+    function telegramView() {
+      var error = el('p', { class: 'kc-error', role: 'alert' });
+      var parts = [el('h3', { text: data.telegramConnected ? '텔레그램이 연결되어 있어요 ✓' : '텔레그램이 아직 연결되지 않았어요' })];
+      if (data.telegramConnected) {
+        parts.push(el('p', { class: 'muted', text: '새 노크와 메시지가 텔레그램으로 와요. 알림에 답장(reply)하면 바로 보내져요.' }));
+        parts.push(el('div', { class: 'kc-actions' }, [el('button', {
+          type: 'button', class: 'kc-btn danger small', text: '연결 끊기',
+          onclick: function () {
+            if (!confirm('텔레그램 연결을 끊을까요?')) return;
+            call('POST', '/api/admin/telegram/disconnect').then(function () { tgInfo = null; refresh(); }).catch(function (err) { error.textContent = errText(err); });
+          }
+        })]));
+      } else {
+        parts.push(el('p', { class: 'muted', text: '연결하기를 누르면 확인 코드가 담긴 봇 링크가 나와요. 텔레그램이 깔린 휴대폰에서 그 링크를 열고 시작(Start)을 누르면 끝이에요. 코드는 10분 동안만 쓸 수 있어요.' }));
+        if (tgInfo) {
+          parts.push(el('p', {}, ['봇: @' + tgInfo.bot + ' · 확인 코드: ', el('strong', { text: tgInfo.code })]));
+          parts.push(el('div', { class: 'kc-actions' }, [el('a', { class: 'kc-btn small', href: tgInfo.link, target: '_blank', rel: 'noopener', text: '텔레그램에서 열기' })]));
+          parts.push(linkBox(tgInfo.link));
+          parts.push(el('p', { class: 'muted', text: '연결이 끝나면 이 페이지를 새로고침하세요.' }));
+        }
+        parts.push(el('div', { class: 'kc-actions' }, [el('button', {
+          type: 'button', class: 'kc-btn small', text: tgInfo ? '코드 다시 만들기' : '연결하기',
+          onclick: function () {
+            call('POST', '/api/admin/telegram/connect').then(function (d) { tgInfo = d; render(); }).catch(function (err) { error.textContent = errText(err); });
+          }
+        })]));
+      }
+      parts.push(error);
+      parts.push(el('p', { class: 'muted', style: 'margin-top:16px', text: '번역 모델: ' + (data.model || '') }));
+      return el('div', { class: 'card' }, parts);
+    }
+
+    // ---------- 대화방 ----------
+
+    function openConversation(id) {
+      openConvId = id;
+      editingId = null;
+      composeDraft = '';
+      loadConversation();
+    }
+
+    function loadConversation(quiet) {
+      return call('GET', '/api/admin/conversations/' + openConvId).then(function (d) {
+        var changed = !conv || JSON.stringify(d) !== JSON.stringify(conv);
+        conv = d;
+        if (!quiet || (changed && !editingId)) render();
+      }).catch(function (err) {
+        if (err.status === 404) { openConvId = null; conv = null; refresh(); }
+      });
+    }
+
+    function ownerMessage(m) {
+      var mine = m.from === 'owner';
+      var box = el('div', { class: 'kc-msg ' + (mine ? 'mine' : 'theirs') });
+      if (m.deleted) {
+        box.appendChild(el('div', { class: 'kc-bubble deleted', text: '지워진 메시지' }));
+        box.appendChild(el('div', { class: 'kc-meta' }, [time(m.at)]));
+        return box;
+      }
+      if (mine && editingId === m.id) { box.appendChild(editBox(m)); return box; }
+      var key = 'm' + m.id;
+      var shown;
+      var extraLabel = null;
+      var extraText = null;
+      if (mine) {
+        shown = m.body;
+        if (m.translation && m.translation !== m.body) { extraLabel = '번역 보기'; extraText = m.translation; }
+      } else {
+        shown = m.translation || m.body;
+        if (m.translation && m.translation !== m.body) { extraLabel = 'Original'; extraText = m.body; }
+      }
+      box.appendChild(el('div', { class: 'kc-bubble', text: shown }));
+      if (extraText && openOriginals[key]) box.appendChild(el('div', { class: 'kc-original', text: extraText }));
+      var status = '';
+      if (m.trStatus === 'pending' || m.trStatus === 'working') status = '번역 중…';
+      else if (m.trStatus === 'failed') status = '번역 실패';
+      else if (m.trStatus === 'waitlang') status = '상대 언어를 기다리는 중';
+      var meta = [el('span', { text: (mine ? '나' : conv.conversation.name) + ' · ' + time(m.at) })];
+      if (m.edited) meta.push(el('span', { text: 'edited' }));
+      if (!mine && m.srcLang) meta.push(el('span', { text: m.srcLang }));
+      if (status) meta.push(el('span', { text: status }));
+      if (extraText) meta.push(el('button', { type: 'button', class: 'kc-link', text: openOriginals[key] ? '닫기' : extraLabel, onclick: function () { openOriginals[key] = !openOriginals[key]; render(); } }));
+      if (mine) {
+        meta.push(el('button', { type: 'button', class: 'kc-link', text: '수정', onclick: function () { editingId = m.id; render(); } }));
+        meta.push(el('button', {
+          type: 'button', class: 'kc-link danger', text: '삭제',
+          onclick: function () {
+            if (!confirm('이 메시지를 지울까요?')) return;
+            call('DELETE', '/api/admin/messages/' + m.id).then(function (d) { conv = d; render(); }).catch(function (err) { alert(errText(err)); });
+          }
+        }));
+      }
+      box.appendChild(el('div', { class: 'kc-meta' }, meta));
+      return box;
+    }
+
+    function editBox(m) {
+      var area = el('textarea', { class: 'kc-input', rows: '4', 'aria-label': '메시지 고치기' });
+      area.value = m.body;
+      var error = el('p', { class: 'kc-error', role: 'alert' });
+      var save = el('button', { type: 'button', class: 'kc-btn small', text: '저장' });
+      save.addEventListener('click', function () {
+        save.disabled = true;
+        call('PATCH', '/api/admin/messages/' + m.id, { text: area.value })
+          .then(function (d) { editingId = null; conv = d; render(); })
+          .catch(function (err) { save.disabled = false; error.textContent = errText(err); });
+      });
+      setTimeout(function () { area.focus(); }, 0);
+      return el('div', { class: 'kc-edit-box' }, [area, error, el('div', { class: 'kc-actions' }, [
+        el('button', { type: 'button', class: 'kc-btn quiet small', text: '취소', onclick: function () { editingId = null; render(); } }),
+        save
+      ])]);
+    }
+
+    function conversationView() {
+      var c = conv.conversation;
+      var head = el('div', { class: 'detail-head' }, [
+        el('div', {}, [
+          el('button', { type: 'button', class: 'kc-link', text: '← 목록', onclick: function () { openConvId = null; conv = null; refresh(); } }),
+          el('h2', {}, [c.name, c.revoked ? el('span', { class: 'tag', text: '폐기됨' }) : null, c.hasPasscode ? el('span', { class: 'tag', text: '암호' }) : null]),
+          el('div', { class: 'muted', text: langName(c.lang) + ' · 시작 ' + time(c.createdAt) + ' · 상대 남은 메시지 ' + c.remaining + '개' })
+        ]),
+        el('div', { class: 'kc-actions', style: 'margin-top:0' }, [
+          c.revoked ? null : el('button', {
+            type: 'button', class: 'kc-btn quiet small', text: '링크 폐기',
+            onclick: function () {
+              if (!confirm('이 링크를 폐기할까요? 상대는 더 이상 이 대화방을 열 수 없어요. 기록은 남아요.')) return;
+              call('POST', '/api/admin/conversations/' + c.id + '/revoke').then(function () { loadConversation(); });
+            }
+          }),
+          el('button', {
+            type: 'button', class: 'kc-btn danger small', text: '대화 삭제',
+            onclick: function () {
+              if (!confirm('이 대화를 완전히 지울까요? 되돌릴 수 없어요.')) return;
+              call('DELETE', '/api/admin/conversations/' + c.id).then(function () { openConvId = null; conv = null; refresh(); });
+            }
+          })
+        ])
+      ]);
+      var parts = [head];
+      if (!c.revoked) parts.push(linkBox(c.link));
+      var thread = el('div', { class: 'kc-thread' });
+      if (!conv.messages.length) thread.appendChild(el('p', { class: 'empty', text: '아직 메시지가 없어요. 먼저 인사를 건네도 좋아요.' }));
+      conv.messages.forEach(function (m) { thread.appendChild(ownerMessage(m)); });
+      parts.push(thread);
+      if (!c.revoked) {
+        var area = el('textarea', { class: 'kc-input', id: 'compose', rows: '3', placeholder: '한국어로 쓰면 상대 언어로 번역돼요', 'aria-label': '답장' });
+        area.value = composeDraft;
+        var counter = el('div', { class: 'kc-counter', text: K.charCount(composeDraft) + ' / 1000' });
+        var error = el('p', { class: 'kc-error', role: 'alert' });
+        area.addEventListener('input', function () {
+          composeDraft = area.value;
+          var n = K.charCount(area.value);
+          counter.textContent = n + ' / 1000';
+          counter.classList.toggle('over', n > 1000);
+        });
+        var send = el('button', { type: 'button', class: 'kc-btn', text: '보내기' });
+        send.addEventListener('click', function () {
+          if (!area.value.trim()) return;
+          send.disabled = true;
+          call('POST', '/api/admin/conversations/' + c.id + '/messages', { text: area.value })
+            .then(function (d) { composeDraft = ''; conv = d; render(); window.scrollTo(0, document.body.scrollHeight); })
+            .catch(function (err) { send.disabled = false; error.textContent = errText(err); });
+        });
+        parts.push(el('div', { class: 'composer' }, [area, counter, error, el('div', { class: 'kc-actions', style: 'margin-top:6px;justify-content:flex-end' }, [send])]));
+      }
+      return el('div', {}, parts);
+    }
+
+    // ---------- 그리기와 새로고침 ----------
+
+    function render() {
+      logoutBtn.classList.remove('kc-hidden');
+      var active = document.activeElement && document.activeElement.id === 'compose';
+      view.innerHTML = '';
+      if (openConvId && conv) {
+        view.appendChild(conversationView());
+      } else {
+        view.appendChild(tabs());
+        if (tab === 'knocks') view.appendChild(knocksView());
+        else if (tab === 'convs') view.appendChild(convsView());
+        else if (tab === 'new') view.appendChild(newView());
+        else view.appendChild(telegramView());
+      }
+      if (active) {
+        var c = document.getElementById('compose');
+        if (c) { c.focus(); c.setSelectionRange(c.value.length, c.value.length); }
+      }
+    }
+
+    function refresh(quiet) {
+      return call('GET', '/api/admin/overview').then(function (d) {
+        var changed = !data || JSON.stringify(d) !== JSON.stringify(data);
+        data = d;
+        if (!openConvId && (!quiet || changed)) {
+          // 노크 답장을 쓰는 중이면 조용한 새로고침은 화면을 다시 그리지 않는다
+          var typing = document.activeElement && document.activeElement.tagName === 'TEXTAREA';
+          if (!quiet || !typing) render();
+        }
+        startPolling();
+      }).catch(function (err) {
+        if (err.status !== 401 && !quiet) {
+          view.innerHTML = '';
+          view.appendChild(el('p', { class: 'kc-error', text: '불러오지 못했어요: ' + errText(err) }));
+        }
+      });
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(function () {
+        if (document.visibilityState !== 'visible' || !token) return;
+        if (openConvId) loadConversation(true);
+        else refresh(true);
+      }, 20000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    if (!K.enabled()) {
+      view.appendChild(el('p', { class: 'card', text: '아직 서버 주소가 없어요. chat/config.js의 apiBase에 Worker 주소를 넣어주세요.' }));
+      return;
+    }
+    if (token) refresh(); else showLogin();
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="referrer" content="no-referrer">
+  <title>Conversation with K</title>
+  <link rel="stylesheet" href="chat.css">
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--serif);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    .page { max-width: 640px; margin: 0 auto; padding: 0 16px 48px; }
+    header { padding: 22px 0 12px; border-bottom: 1px solid var(--line); }
+    header a.home { font-family: var(--sans); font-size: 13px; color: var(--ink-faint); text-decoration: none; }
+    header h1 { margin: 6px 0 2px; font-size: 24px; font-weight: 500; }
+    header p { margin: 0; color: var(--ink-soft); font-size: 15px; font-style: italic; }
+    #thread { padding: 20px 0; }
+    .empty { color: var(--ink-faint); font-style: italic; text-align: center; padding: 24px 0; }
+    .composer { position: sticky; bottom: 0; background: var(--paper); padding: 12px 0 8px; border-top: 1px solid var(--line); }
+    .composer-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 8px; }
+    .turns { font-family: var(--sans); font-size: 13px; color: var(--ink-soft); }
+    .closed-note { padding: 14px 16px; background: var(--paper-deep); border-radius: 12px; font-size: 15px; color: var(--ink-soft); }
+    .center { text-align: center; padding: 60px 0; }
+    .center p { color: var(--ink-soft); }
+    .lock { max-width: 360px; margin: 48px auto; }
+    footer { margin-top: 28px; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <a class="home" href="/">← KBook</a>
+      <h1>A conversation with K</h1>
+      <p>Replies aren't real time. I read every message and answer when I can.</p>
+    </header>
+
+    <section id="view"></section>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="common.js"></script>
+  <script>
+  (function () {
+    var K = window.KChat;
+    var el = K.el;
+    var view = document.getElementById('view');
+    var roomKey = '';
+    var unlock = '';
+    var state = null;
+    var openOriginals = {};
+    var editingId = null;
+    var draft = '';
+    var pollTimer = null;
+    var busy = false;
+
+    function readKey() {
+      var m = /(?:^|[#&])k=([A-Za-z0-9_-]+)/.exec(location.hash);
+      if (m) {
+        K.store.set(K.KEYS.roomKey, m[1]);
+        return m[1];
+      }
+      return K.store.get(K.KEYS.roomKey) || '';
+    }
+
+    function headers() {
+      var h = { 'X-Room-Key': roomKey };
+      if (unlock) h['X-Room-Unlock'] = unlock;
+      return h;
+    }
+
+    function message(title, text, extra) {
+      stopPolling();
+      view.innerHTML = '';
+      view.appendChild(el('div', { class: 'center' }, [
+        el('h2', { text: title, style: 'font-weight:500' }),
+        el('p', { text: text }),
+        extra || el('a', { class: 'kc-btn quiet', href: '/', text: 'Back to KBook' })
+      ]));
+    }
+
+    function forget() {
+      K.store.remove(K.KEYS.roomKey);
+      K.store.remove(K.KEYS.unlockPrefix + roomKey);
+    }
+
+    function handleError(err) {
+      if (err.code === 'passcode_required') { unlock = ''; K.store.remove(K.KEYS.unlockPrefix + roomKey); showLock(); return true; }
+      if (err.status === 410) { forget(); message('This link is closed', 'This conversation is no longer open. Thank you for writing.'); return true; }
+      if (err.status === 404 && err.code === 'not_found') { forget(); K.store.remove(K.KEYS.knockToken); message('Conversation not found', 'This conversation doesn\'t exist anymore. It may have been deleted.'); return true; }
+      return false;
+    }
+
+    function showLock(errorText) {
+      stopPolling();
+      var input = el('input', { class: 'kc-input', id: 'pass', type: 'password', autocomplete: 'off' });
+      var error = el('p', { class: 'kc-error', role: 'alert', text: errorText || '' });
+      var btn = el('button', { class: 'kc-btn', type: 'submit', text: 'Enter' });
+      var form = el('form', { class: 'lock' }, [
+        el('p', { text: 'This conversation has a passcode. You only need to enter it once on this device.' }),
+        el('label', { class: 'kc-label', for: 'pass', text: 'Passcode' }),
+        input,
+        error,
+        el('div', { class: 'kc-actions' }, [btn])
+      ]);
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        btn.disabled = true;
+        K.api('POST', '/api/room/unlock', { headers: { 'X-Room-Key': roomKey }, body: { passcode: input.value } })
+          .then(function (data) {
+            unlock = data.unlock;
+            K.store.set(K.KEYS.unlockPrefix + roomKey, unlock);
+            load();
+          })
+          .catch(function (err) {
+            btn.disabled = false;
+            if (handleError(err)) return;
+            if (err.code === 'locked') error.textContent = 'Too many tries. Please wait 15 minutes and try again.';
+            else if (err.code === 'wrong_passcode') error.textContent = 'That passcode doesn\'t match.';
+            else error.textContent = 'Something went wrong. Please try again.';
+          });
+      });
+      view.innerHTML = '';
+      view.appendChild(form);
+      input.focus();
+    }
+
+    function renderMessage(m) {
+      var mine = m.from === 'you';
+      var box = el('div', { class: 'kc-msg ' + (mine ? 'mine' : 'theirs') });
+      if (m.deleted) {
+        box.appendChild(el('div', { class: 'kc-bubble deleted', text: 'Message deleted' }));
+        box.appendChild(el('div', { class: 'kc-meta' }, [K.formatTime(m.at)]));
+        return box;
+      }
+      if (mine && editingId === m.id) {
+        box.appendChild(editBox(m));
+        return box;
+      }
+      if (m.translating) box.appendChild(el('div', { class: 'kc-bubble pending', text: 'Translating…' }));
+      else box.appendChild(el('div', { class: 'kc-bubble', text: m.text }));
+      if (m.original && openOriginals[m.id]) box.appendChild(el('div', { class: 'kc-original', lang: 'ko', text: m.original }));
+
+      var meta = [el('span', { text: (mine ? 'You' : 'K') + ' · ' + K.formatTime(m.at) })];
+      if (m.edited) meta.push(el('span', { text: 'edited' }));
+      if (m.original) {
+        meta.push(el('button', {
+          type: 'button', class: 'kc-link', 'aria-expanded': openOriginals[m.id] ? 'true' : 'false',
+          text: openOriginals[m.id] ? 'Hide original' : 'Original',
+          onclick: function () { openOriginals[m.id] = !openOriginals[m.id]; render(); }
+        }));
+      }
+      if (mine) {
+        meta.push(el('button', { type: 'button', class: 'kc-link', text: 'Edit', onclick: function () { editingId = m.id; render(); } }));
+        meta.push(el('button', { type: 'button', class: 'kc-link danger', text: 'Delete', onclick: function () { removeMessage(m); } }));
+      }
+      box.appendChild(el('div', { class: 'kc-meta' }, meta));
+      return box;
+    }
+
+    function editBox(m) {
+      var area = el('textarea', { class: 'kc-input', rows: '4', 'aria-label': 'Edit your message' });
+      area.value = m.text;
+      var counter = el('div', { class: 'kc-counter', text: K.charCount(area.value) + ' / ' + state.maxChars });
+      var error = el('p', { class: 'kc-error', role: 'alert' });
+      area.addEventListener('input', function () {
+        var n = K.charCount(area.value);
+        counter.textContent = n + ' / ' + state.maxChars;
+        counter.classList.toggle('over', n > state.maxChars);
+      });
+      var save = el('button', { type: 'button', class: 'kc-btn small', text: 'Save' });
+      save.addEventListener('click', function () {
+        var text = area.value.trim();
+        if (!text) { error.textContent = 'A message can\'t be empty. Use Delete instead.'; return; }
+        if (K.charCount(text) > state.maxChars) { error.textContent = 'Please keep it under ' + state.maxChars + ' characters.'; return; }
+        save.disabled = true;
+        K.api('PATCH', '/api/room/messages/' + m.id, { headers: headers(), body: { text: text } })
+          .then(function (data) { editingId = null; state = data; render(); })
+          .catch(function (err) {
+            save.disabled = false;
+            if (handleError(err)) return;
+            error.textContent = err.code === 'edit_limit' ? 'You\'ve edited a lot today. Please try again tomorrow.' : 'Couldn\'t save. Please try again.';
+          });
+      });
+      setTimeout(function () { area.focus(); }, 0);
+      return el('div', { class: 'kc-edit-box' }, [area, counter, error, el('div', { class: 'kc-actions' }, [
+        el('button', { type: 'button', class: 'kc-btn quiet small', text: 'Cancel', onclick: function () { editingId = null; render(); } }),
+        save
+      ])]);
+    }
+
+    function removeMessage(m) {
+      if (!confirm('Delete this message?')) return;
+      K.api('DELETE', '/api/room/messages/' + m.id, { headers: headers() })
+        .then(function (data) { state = data; render(); })
+        .catch(function (err) { if (!handleError(err)) alert('Couldn\'t delete. Please try again.'); });
+    }
+
+    function deleteConversation() {
+      if (!confirm('Delete this whole conversation? This removes every message for both of us and closes this link. It can\'t be undone.')) return;
+      K.api('DELETE', '/api/room', { headers: headers() })
+        .then(function () {
+          forget();
+          K.store.remove(K.KEYS.knockToken);
+          message('Deleted', 'Our conversation has been deleted. Thank you for writing.');
+        })
+        .catch(function (err) { if (!handleError(err)) alert('Couldn\'t delete. Please try again.'); });
+    }
+
+    function turnsText() {
+      if (state.remaining <= 0) return 'You\'ve sent ' + state.maxTurns + ' messages. You can write again after I reply.';
+      if (state.remaining === 1) return 'You can send 1 more message before I reply.';
+      return 'You can send ' + state.remaining + ' more messages before I reply.';
+    }
+
+    function composer() {
+      var area = el('textarea', { class: 'kc-input', id: 'compose', rows: '3', placeholder: 'Write in any language…', 'aria-label': 'Your message' });
+      area.value = draft;
+      var counter = el('div', { class: 'kc-counter', text: K.charCount(draft) + ' / ' + state.maxChars });
+      var error = el('p', { class: 'kc-error', role: 'alert' });
+      var send = el('button', { type: 'button', class: 'kc-btn', text: 'Send' });
+      var closed = state.remaining <= 0;
+      area.disabled = closed;
+      send.disabled = closed;
+      area.addEventListener('input', function () {
+        draft = area.value;
+        var n = K.charCount(area.value);
+        counter.textContent = n + ' / ' + state.maxChars;
+        counter.classList.toggle('over', n > state.maxChars);
+      });
+      send.addEventListener('click', function () {
+        var text = area.value.trim();
+        if (!text) return;
+        if (K.charCount(text) > state.maxChars) { error.textContent = 'Please keep it under ' + state.maxChars + ' characters.'; return; }
+        send.disabled = true;
+        busy = true;
+        K.api('POST', '/api/room/messages', { headers: headers(), body: { text: text } })
+          .then(function (data) { draft = ''; state = data; busy = false; render(); window.scrollTo(0, document.body.scrollHeight); })
+          .catch(function (err) {
+            busy = false;
+            send.disabled = false;
+            if (handleError(err)) return;
+            if (err.code === 'turn_limit') { load(); return; }
+            error.textContent = 'Couldn\'t send. Please try again.';
+          });
+      });
+      return el('div', { class: 'composer' }, [
+        closed ? el('div', { class: 'closed-note', text: turnsText() }) : area,
+        closed ? null : counter,
+        error,
+        el('div', { class: 'composer-row' }, [el('span', { class: 'turns', text: closed ? '' : turnsText() }), closed ? null : send])
+      ]);
+    }
+
+    function render() {
+      var active = document.activeElement && document.activeElement.id === 'compose';
+      view.innerHTML = '';
+      var thread = el('div', { class: 'kc-thread', id: 'thread' });
+      if (!state.messages.length) thread.appendChild(el('p', { class: 'empty', text: 'Say hello. Write in any language you like.' }));
+      state.messages.forEach(function (m) { thread.appendChild(renderMessage(m)); });
+      view.appendChild(thread);
+      view.appendChild(composer());
+      view.appendChild(el('footer', {}, [
+        el('p', { class: 'kc-privacy' }, [el('strong', { text: 'Privacy, briefly. ' }), K.PRIVACY_NOTE]),
+        el('button', { type: 'button', class: 'kc-btn danger small', text: 'Delete this conversation', onclick: deleteConversation })
+      ]));
+      if (active) {
+        var c = document.getElementById('compose');
+        if (c) { c.focus(); c.setSelectionRange(c.value.length, c.value.length); }
+      }
+    }
+
+    function load(quiet) {
+      return K.api('GET', '/api/room?lang=' + encodeURIComponent(K.browserLang()), { headers: headers() })
+        .then(function (data) {
+          var first = !state;
+          var changed = first || JSON.stringify(data) !== JSON.stringify(state);
+          state = data;
+          // 바뀐 것이 없거나, 고치는 중이거나 보내는 중이면 화면을 다시 그리지 않는다
+          if (!quiet || (changed && !editingId && !busy)) render();
+          if (first) window.scrollTo(0, document.body.scrollHeight);
+          startPolling();
+        })
+        .catch(function (err) {
+          if (handleError(err)) return;
+          if (!quiet) message('Couldn\'t load', 'Please check your connection and refresh the page.', el('button', { class: 'kc-btn', text: 'Try again', onclick: function () { load(); } }));
+        });
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(function () {
+        if (document.visibilityState === 'visible') load(true);
+      }, 15000);
+    }
+
+    function stopPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && state && pollTimer) load(true);
+    });
+
+    if (!K.enabled()) { message('Not open yet', 'Conversations aren\'t open yet. Please come back soon.'); return; }
+    roomKey = readKey();
+    if (!roomKey) { message('You need an invitation', 'This page opens with a personal invitation link. If you\'d like to write to me, knock from the front page.', el('a', { class: 'kc-btn', href: '/', text: 'Go to the front page' })); return; }
+    unlock = K.store.get(K.KEYS.unlockPrefix + roomKey) || '';
+    view.appendChild(el('p', { class: 'empty', text: 'Opening…' }));
+    load();
+  })();
+  </script>
+</body>
+</html>

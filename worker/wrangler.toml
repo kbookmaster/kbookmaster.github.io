@@ -1,0 +1,29 @@
+# 채팅 코너 서버 (Cloudflare Worker) 설정
+# 비밀 값(API 키, 봇 토큰, 비밀번호)은 여기에 절대 적지 않는다. Cloudflare 비밀 보관함에 넣는다.
+
+name = "kbook-chat"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# 번역 모델. 이 한 줄만 바꾸면 된다.
+# 고를 수 있는 값: "claude-opus-5-5" (기본), "claude-sonnet-5-5", "claude-haiku-4-5-20251001"
+TRANSLATE_MODEL = "claude-opus-5-5"
+
+# 화면이 있는 사이트 주소 (초대 링크를 만들 때 쓴다)
+SITE_URL = "https://kbookmaster.github.io"
+
+# 이 서버에 말을 걸 수 있는 사이트 주소들 (쉼표로 구분)
+ALLOWED_ORIGINS = "https://kbookmaster.github.io"
+
+# 2분마다 밀린 번역과 텔레그램 알림을 다시 시도한다
+[triggers]
+crons = ["*/2 * * * *"]
+
+# 대화 장부 (D1). database_id는 Cloudflare에서 D1을 만든 뒤 받은 값으로 바꾼다.
+# 이 값은 비밀이 아니다 (계정에 로그인해야만 쓸 수 있다).
+[[d1_databases]]
+binding = "DB"
+database_name = "kbook-chat"
+database_id = "00000000-0000-0000-0000-000000000000"

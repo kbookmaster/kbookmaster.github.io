@@ -1,0 +1,9 @@
+# 내 컴퓨터에서 시험할 때만 쓰는 가짜 설정. 실제 비밀은 넣지 않는다.
+# 이 파일을 .dev.vars로 복사해서 쓴다. (.dev.vars는 저장소에 올라가지 않는다)
+SITE_URL=http://localhost:8000
+ALLOWED_ORIGINS=http://localhost:8000
+FAKE_TRANSLATE=1
+FAKE_TELEGRAM=1
+FAKE_TURNSTILE=1
+ADMIN_PASSWORD=test-password
+TELEGRAM_BOT_TOKEN=fake-token

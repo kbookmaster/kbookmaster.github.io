@@ -12,7 +12,7 @@
 
 주의: 이 저장소는 공개다. 이 문서에는 비밀, 키, 비밀번호, 개인 정보를 절대 적지 않는다.
 
-마지막 갱신: 2026-10-05 (최소화 원칙, 기능 자동 꺼짐)
+마지막 갱신: 2026-10-05 (첫 배포, 배포 방법을 세션 직접 배포로 바꿈)
 
 ## 지금 상태 (한눈에)
 
@@ -42,7 +42,7 @@
 | 사람 확인 | Cloudflare Turnstile | 노크 창, 관리자 로그인 |
 
 - 화면(HTML)은 GitHub Pages가 보여주고, 화면은 Cloudflare Worker 주소로 말을 건다.
-- Cloudflare가 이 저장소의 `worker/` 폴더를 지켜보다가 main에 푸시되면 자동으로 다시 배포한다.
+- 서버 배포는 자동이 아니다. `worker/`를 고치면 Claude 세션에서 직접 배포한다 (12장).
 - 관리 페이지에서 답하든 텔레그램에서 답하든 같은 장부(D1)에 기록된다.
 
 ### 스위치: 아직 서버가 없을 때
@@ -263,10 +263,28 @@ worker/test/run.mjs      가짜 번역, 가짜 텔레그램으로 하는 내부 
 ## 12. 배포 설정 메모 (Cloudflare)
 
 - Worker 이름: `kbook-chat`
-- Cloudflare Workers Builds로 이 저장소를 연결한다.
-  - 지켜볼 브랜치: `main`
-  - 루트 디렉터리(Root directory): `worker`
-  - 배포 명령(Deploy command): `npx wrangler deploy`
-- D1 데이터베이스 이름: `kbook-chat`. 받은 database_id를 `worker/wrangler.toml`에 넣는다.
-- 배포가 끝나면 Worker 주소를 `chat/config.js`의 `apiBase`에 넣는다. Turnstile을 켤 때 사이트 키를 `turnstileSiteKey`에 넣는다.
+- Worker 주소: `https://kbook-chat.kbookmaster.workers.dev` (이미 `chat/config.js`의 `apiBase`에 들어 있다)
+- D1 데이터베이스: `kbook-chat` (database_id는 `worker/wrangler.toml`에 있다). 표는 서버가 처음 요청을 받을 때 스스로 만든다.
+- workers.dev 하위 주소 `kbookmaster`는 2026-10-05에 API로 만들었다.
+
+### 배포 방법: Claude 세션에서 직접
+Workers Builds(저장소 자동 연결)는 쓰지 않는다. main에 푸시해도 서버는 바뀌지 않는다.
+
+- 세션 환경 `cloudflare`에서 한다. 이 환경은 `api.cloudflare.com`과 `*.workers.dev`에 접속할 수 있다.
+- Cloudflare API 토큰은 환경의 API credentials에 들어 있고, `api.cloudflare.com`으로 가는 요청에 프록시가 자동으로 붙인다. 세션은 그 값을 보지 못하고, 주인에게 묻지도 않는다.
+- wrangler는 토큰 환경변수가 없으면 브라우저 로그인을 하려고 멈춘다. 그래서 자리만 채우는 가짜 값을 주고, 진짜 인증은 프록시에 맡긴다.
+
+```
+cd worker
+npm ci
+CLOUDFLARE_API_TOKEN=placeholder CLOUDFLARE_ACCOUNT_ID=<계정 ID> npx wrangler deploy
+```
+
+- 계정 ID는 `curl https://api.cloudflare.com/client/v4/accounts`로 확인한다 (비밀은 아니지만 이 문서에는 적지 않는다).
+- 새 workers.dev 주소는 처음 몇 분 동안 인증서 오류(handshake failure)가 날 수 있다. 기다리면 풀린다.
+- wrangler가 사용 통계를 보내려다 막히는 경고(sparrow.cloudflare.com)는 무시해도 된다.
+- 비밀(`ADMIN_PASSWORD` 등)은 세션이 넣지 않는다. 주인이 Cloudflare 화면(Workers > kbook-chat > Settings > Variables and Secrets)에서 넣는다. 넣으면 다시 배포하지 않아도 바로 적용된다.
+
+### Turnstile을 켤 때
+- 사이트 키를 `chat/config.js`의 `turnstileSiteKey`에 넣는다.
 - Turnstile 위젯의 허용 도메인(hostname): `kbookmaster.github.io`

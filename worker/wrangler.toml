@@ -21,9 +21,9 @@ ALLOWED_ORIGINS = "https://kbookmaster.github.io"
 [triggers]
 crons = ["*/2 * * * *"]
 
-# 대화 장부 (D1). database_id는 Cloudflare에서 D1을 만든 뒤 받은 값으로 바꾼다.
+# 대화 장부 (D1). database_id는 Cloudflare에서 만든 kbook-chat 데이터베이스의 값이다.
 # 이 값은 비밀이 아니다 (계정에 로그인해야만 쓸 수 있다).
 [[d1_databases]]
 binding = "DB"
 database_name = "kbook-chat"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "26100e4f-95f1-4e45-b4ba-b5ef838f5437"

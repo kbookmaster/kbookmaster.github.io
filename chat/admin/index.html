@@ -227,7 +227,8 @@
       return el('article', { class: 'card' }, [
         el('div', { class: 'row' }, [el('h3', { text: k.name }), el('span', { class: 'muted', text: langName(k.lang) + ' · ' + time(k.at) })]),
         el('div', { class: 'letter', text: k.translation || k.letter }),
-        k.translation ? null : el('div', { class: 'muted', text: k.trStatus === 'failed' ? '번역 실패, 원문입니다' : '번역 중…' }),
+        k.trStatus === 'failed' ? el('div', { class: 'muted', text: '번역 실패, 원문입니다' }) : null,
+        k.trStatus === 'pending' || k.trStatus === 'working' ? el('div', { class: 'muted', text: '번역 중…' }) : null,
         translated && showOrig ? el('div', { class: 'kc-original', text: k.letter }) : null,
         translated ? el('button', { type: 'button', class: 'kc-link', text: showOrig ? '원문 닫기' : 'Original', onclick: function () { openOriginals['k' + k.id] = !showOrig; render(); } }) : null,
         el('div', { style: 'margin-top:12px' }, [area]),
@@ -330,6 +331,17 @@
       parts.push(error);
       parts.push(el('p', { class: 'muted', style: 'margin-top:16px', text: '번역 모델: ' + (data.model || '') }));
       return el('div', { class: 'card' }, parts);
+    }
+
+    // 비밀 값이 없어서 꺼져 있는 기능을 한 줄로 알려준다
+    function offNote() {
+      var f = data.features || {};
+      var off = [];
+      if (!f.translate) off.push('번역 (ANTHROPIC_API_KEY)');
+      if (!f.telegram) off.push('텔레그램 (TELEGRAM_BOT_TOKEN)');
+      if (!f.turnstile) off.push('사람 확인 (TURNSTILE_SECRET_KEY)');
+      if (!off.length) return null;
+      return el('p', { class: 'muted', style: 'margin:-6px 0 14px', text: '꺼진 기능: ' + off.join(', ') + '. 괄호 속 비밀 값을 넣으면 켜져요.' });
     }
 
     // ---------- 대화방 ----------
@@ -479,6 +491,8 @@
         view.appendChild(conversationView());
       } else {
         view.appendChild(tabs());
+        var note = offNote();
+        if (note) view.appendChild(note);
         if (tab === 'knocks') view.appendChild(knocksView());
         else if (tab === 'convs') view.appendChild(convsView());
         else if (tab === 'new') view.appendChild(newView());

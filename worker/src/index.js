@@ -8,7 +8,7 @@ import {
 import {
   addVisitorMessage, addOwnerMessage, editMessage, softDeleteMessage, createConversation, inviteKnock,
   setConversationLang, processPending, visitorRoomView, ownerRoomView, conversationSummary,
-  checkMessageText, inviteLink,
+  checkMessageText, inviteLink, notifyKnockNow,
 } from './logic.js';
 import {
   enqueue, callTelegram, webhookSecret, sendText, findReplyTarget, deletedMessageText, deletedConversationText,
@@ -21,16 +21,22 @@ function isLocalHost(hostname) {
   return hostname === 'localhost' || hostname === '127.0.0.1';
 }
 
+// 번역, 텔레그램, Turnstile은 비밀 값이 있을 때만 켜진다. 없으면 자동으로 꺼진다.
 // 가짜 스위치는 사이트 주소와 요청 주소가 모두 내 컴퓨터일 때만 듣는다
 function getFlags(env, request) {
   let local = false;
   try { local = isLocalHost(new URL(env.SITE_URL).hostname); } catch (e) { local = false; }
   if (request) local = local && isLocalHost(new URL(request.url).hostname);
+  const fakeTranslate = local && env.FAKE_TRANSLATE === '1';
+  const fakeTelegram = local && env.FAKE_TELEGRAM === '1';
+  const fakeTurnstile = local && env.FAKE_TURNSTILE === '1';
   return {
     local,
-    fakeTranslate: local && env.FAKE_TRANSLATE === '1',
-    fakeTelegram: local && env.FAKE_TELEGRAM === '1',
-    fakeTurnstile: local && env.FAKE_TURNSTILE === '1',
+    fakeTranslate,
+    fakeTelegram,
+    translate: fakeTranslate || !!env.ANTHROPIC_API_KEY,
+    telegram: !!env.TELEGRAM_BOT_TOKEN,
+    turnstile: !fakeTurnstile && !!env.TURNSTILE_SECRET_KEY,
   };
 }
 
@@ -53,8 +59,7 @@ function corsHeaders(env, request, flags) {
 }
 
 async function verifyTurnstile(env, flags, token) {
-  if (flags.fakeTurnstile) return;
-  if (!env.TURNSTILE_SECRET_KEY) throw new HttpError(503, 'turnstile_not_configured');
+  if (!flags.turnstile) return;
   if (!token || typeof token !== 'string') throw new HttpError(400, 'turnstile_missing');
   const form = new FormData();
   form.append('secret', env.TURNSTILE_SECRET_KEY);
@@ -78,9 +83,10 @@ async function postKnock(env, flags, request, ctx) {
   const recent = await first(env, 'SELECT COUNT(*) AS n FROM knocks WHERE created_at > ?', Date.now() - 86400000);
   if (recent.n >= LIMITS.knocksPerDay) throw new HttpError(429, 'busy');
   const token = randomToken(24);
-  await run(env, 'INSERT INTO knocks (token, name, letter, lang, created_at) VALUES (?, ?, ?, ?, ?)',
-    token, name, letter, cleanLang(body.lang), Date.now());
-  ctx.waitUntil(processPending(env, flags));
+  const meta = await run(env, 'INSERT INTO knocks (token, name, letter, lang, tr_status, notify_pending, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    token, name, letter, cleanLang(body.lang), flags.translate ? 'pending' : 'none', flags.translate ? 1 : 0, Date.now());
+  if (flags.translate) ctx.waitUntil(processPending(env, flags));
+  else await notifyKnockNow(env, flags, meta.last_row_id, ctx);
   return json({ token });
 }
 
@@ -142,12 +148,12 @@ async function postUnlock(env, request) {
   return json({ unlock: await unlockValue(conv) });
 }
 
-async function getRoom(env, request, url) {
+async function getRoom(env, flags, request, url) {
   const conv = await requireRoom(env, request);
   // 상대 언어를 아직 모르면 브라우저 언어로 먼저 정한다
   if (!conv.lang) {
     const lang = cleanLang(url.searchParams.get('lang'));
-    if (lang) await setConversationLang(env, conv, lang);
+    if (lang) await setConversationLang(env, flags, conv, lang);
   }
   return json(await visitorRoomView(env, conv));
 }
@@ -163,7 +169,7 @@ async function postRoomMessage(env, flags, request, ctx) {
   const conv = await requireRoom(env, request);
   const body = await readJson(request);
   const text = checkMessageText(body.text);
-  await addVisitorMessage(env, conv, text);
+  await addVisitorMessage(env, flags, conv, text);
   ctx.waitUntil(processPending(env, flags));
   return json(await visitorRoomView(env, conv));
 }
@@ -177,7 +183,7 @@ async function patchRoomMessage(env, flags, request, ctx, id) {
     const count = conv.edit_day === day ? conv.edit_count : 0;
     if (count >= LIMITS.visitorEditsPerDay) throw new HttpError(429, 'edit_limit', { max: LIMITS.visitorEditsPerDay });
     await run(env, 'UPDATE conversations SET edit_day = ?, edit_count = ? WHERE id = ?', day, count + 1, conv.id);
-    await editMessage(env, conv, msg, text);
+    await editMessage(env, flags, conv, msg, text);
     ctx.waitUntil(processPending(env, flags));
   }
   return json(await visitorRoomView(env, conv));
@@ -245,7 +251,7 @@ async function postLogout(env, request) {
   return json({ ok: true });
 }
 
-async function getOverview(env) {
+async function getOverview(env, flags) {
   const knocks = await all(env,
     `SELECT id, name, letter, letter_tr, lang, tr_status, created_at FROM knocks
      WHERE conversation_id IS NULL AND dismissed_at IS NULL ORDER BY id DESC`);
@@ -259,6 +265,7 @@ async function getOverview(env) {
     conversations,
     telegramConnected: !!(await getSetting(env, 'tg_owner_chat')),
     model: env.TRANSLATE_MODEL,
+    features: { translate: flags.translate, telegram: flags.telegram, turnstile: flags.turnstile },
   });
 }
 
@@ -273,7 +280,7 @@ async function postInviteKnock(env, flags, request, ctx, id) {
   const body = await readJson(request);
   const reply = cleanText(body.reply);
   if (reply) checkMessageText(reply);
-  const { conv } = await inviteKnock(env, knock, reply || null);
+  const { conv } = await inviteKnock(env, flags, knock, reply || null);
   ctx.waitUntil(processPending(env, flags));
   return json(await conversationSummary(env, conv));
 }
@@ -326,7 +333,7 @@ async function postOwnerMessage(env, flags, request, ctx, id) {
   if (conv.revoked_at) throw new HttpError(410, 'revoked');
   const body = await readJson(request);
   const text = checkMessageText(body.text);
-  await addOwnerMessage(env, conv, text);
+  await addOwnerMessage(env, flags, conv, text);
   ctx.waitUntil(processPending(env, flags));
   return json(await ownerRoomView(env, conv));
 }
@@ -343,7 +350,7 @@ async function patchOwnerMessage(env, flags, request, ctx, id) {
   const body = await readJson(request);
   const text = checkMessageText(body.text);
   if (text !== msg.body) {
-    await editMessage(env, conv, msg, text);
+    await editMessage(env, flags, conv, msg, text);
     ctx.waitUntil(processPending(env, flags));
   }
   return json(await ownerRoomView(env, conv));
@@ -459,16 +466,16 @@ async function handleTelegramUpdate(env, flags, update) {
     conv = await first(env, 'SELECT * FROM conversations WHERE id = ?', target.conversation_id);
     if (!conv) { await sendText(env, flags, chatId, '이 대화는 이미 지워졌어요.'); return; }
     if (conv.revoked_at) { await sendText(env, flags, chatId, '이 대화의 링크는 폐기되어서 보낼 수 없어요.'); return; }
-    reply = await addOwnerMessage(env, conv, clean, { fromTelegram: true });
+    reply = await addOwnerMessage(env, flags, conv, clean, { fromTelegram: true });
   } else {
     const knock = await first(env, 'SELECT * FROM knocks WHERE id = ?', target.knock_id);
     if (!knock || knock.dismissed_at) { await sendText(env, flags, chatId, '이 노크는 이미 정리되었어요.'); return; }
     if (knock.conversation_id) {
       conv = await first(env, 'SELECT * FROM conversations WHERE id = ?', knock.conversation_id);
       if (!conv || conv.revoked_at) { await sendText(env, flags, chatId, '이 노크의 대화방은 닫혔어요.'); return; }
-      reply = await addOwnerMessage(env, conv, clean, { fromTelegram: true });
+      reply = await addOwnerMessage(env, flags, conv, clean, { fromTelegram: true });
     } else {
-      const invited = await inviteKnock(env, knock, clean, { fromTelegram: true });
+      const invited = await inviteKnock(env, flags, knock, clean, { fromTelegram: true });
       conv = invited.conv;
       reply = invited.reply;
       await sendText(env, flags, chatId,
@@ -516,7 +523,7 @@ async function route(env, flags, request, ctx) {
   if (path === '/api/knock' && method === 'POST') return postKnock(env, flags, request, ctx);
   if (path === '/api/knock/status' && method === 'POST') return postKnockStatus(env, request);
 
-  if (path === '/api/room' && method === 'GET') return getRoom(env, request, url);
+  if (path === '/api/room' && method === 'GET') return getRoom(env, flags, request, url);
   if (path === '/api/room' && method === 'DELETE') return deleteRoom(env, flags, request, ctx);
   if (path === '/api/room/unlock' && method === 'POST') return postUnlock(env, request);
   if (path === '/api/room/messages' && method === 'POST') return postRoomMessage(env, flags, request, ctx);
@@ -529,7 +536,7 @@ async function route(env, flags, request, ctx) {
   if (path.startsWith('/api/admin/')) {
     await requireAdmin(env, request);
     if (path === '/api/admin/logout' && method === 'POST') return postLogout(env, request);
-    if (path === '/api/admin/overview' && method === 'GET') return getOverview(env);
+    if (path === '/api/admin/overview' && method === 'GET') return getOverview(env, flags);
     if ((m = /^\/api\/admin\/knocks\/(\d+)\/invite$/.exec(path)) && method === 'POST') return postInviteKnock(env, flags, request, ctx, Number(m[1]));
     if ((m = /^\/api\/admin\/knocks\/(\d+)$/.exec(path)) && method === 'DELETE') return deleteKnock(env, Number(m[1]));
     if (path === '/api/admin/conversations' && method === 'POST') return postConversation(env, request);
@@ -585,8 +592,10 @@ export default {
 
   async scheduled(event, env, ctx) {
     await ensureSchema(env);
+    const flags = getFlags(env, null);
     ctx.waitUntil((async () => {
-      await processPending(env, getFlags(env, null));
+      // 번역도 텔레그램도 꺼져 있으면 밀린 일이 없으니 건너뛴다
+      if (flags.translate || flags.telegram) await processPending(env, flags);
       await run(env, 'DELETE FROM admin_sessions WHERE expires_at < ?', Date.now());
     })());
   },

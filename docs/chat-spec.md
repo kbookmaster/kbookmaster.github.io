@@ -1,11 +1,32 @@
 # 채팅 코너 설계서 (chat-spec)
 
+## 0. 원칙: 최소화
+
+이 채팅 코너는 안정성과 쾌적함을 위해 코드, 유지, 처리 모두 최소화한다.
+- 새 기능이나 수정은 먼저 꼭 필요한지 따진다.
+- 더 단순한 방법이 있으면 그쪽을 먼저 제안한다.
+- 붙이는 기능은 비밀 값이 없으면 스스로 꺼지게 만든다. 지우지 않고 꺼둔다.
+
 이 문서는 채팅 코너의 기억이다. 기능을 바꿀 때마다 이 문서도 같이 고친다.
 새 세션을 열면 이 문서부터 읽으면 맥락이 되살아난다.
 
 주의: 이 저장소는 공개다. 이 문서에는 비밀, 키, 비밀번호, 개인 정보를 절대 적지 않는다.
 
-마지막 갱신: 2026-10-05 (첫 버전)
+마지막 갱신: 2026-10-05 (최소화 원칙, 기능 자동 꺼짐)
+
+## 지금 상태 (한눈에)
+
+| 기능 | 켜지는 조건 | 꺼져 있을 때 |
+| --- | --- | --- |
+| 번역 | 비밀 `ANTHROPIC_API_KEY`가 있을 때 | 원문만 보여주고 Claude API를 부르지 않는다 |
+| 텔레그램 | 비밀 `TELEGRAM_BOT_TOKEN`이 있을 때 | 알림 없이 관리 페이지에서만 확인한다 |
+| 사람 확인 (Turnstile) | 비밀 `TURNSTILE_SECRET_KEY`가 있을 때 | 사람 확인 없이 노크를 받는다 |
+
+- 지금 필요한 비밀은 `ADMIN_PASSWORD` 하나뿐이다.
+- 관리 페이지 맨 위에 꺼진 기능이 한 줄로 보인다.
+- 비밀을 넣으면 다시 배포하지 않아도 그 순간부터 켜진다.
+- 번역과 텔레그램이 모두 꺼져 있으면 2분마다 도는 정리 작업도 할 일 없이 바로 끝난다.
+- 아래 4장(번역), 6장(텔레그램), Turnstile 설명은 켜졌을 때의 동작이다.
 
 ---
 
@@ -139,12 +160,12 @@
 ## 7. 비밀과 개인정보
 
 ### 7.1 비밀 (Cloudflare 비밀 보관함에만)
-| 이름 | 무엇 |
-| --- | --- |
-| `ANTHROPIC_API_KEY` | Claude API 키 |
-| `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 |
-| `ADMIN_PASSWORD` | 관리자 비밀번호 |
-| `TURNSTILE_SECRET_KEY` | Turnstile 비밀 키 |
+| 이름 | 무엇 | 지금 |
+| --- | --- | --- |
+| `ADMIN_PASSWORD` | 관리자 비밀번호 | 필수 |
+| `ANTHROPIC_API_KEY` | Claude API 키 | 나중에 (없으면 번역 꺼짐) |
+| `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 | 나중에 (없으면 텔레그램 꺼짐) |
+| `TURNSTILE_SECRET_KEY` | Turnstile 비밀 키 | 나중에 (없으면 사람 확인 꺼짐) |
 
 - 저장소에는 절대 넣지 않는다. 채팅에도 붙여넣지 않는다.
 - Turnstile의 사이트 키(site key)는 공개용이라 `chat/config.js`에 넣어도 된다.
@@ -215,6 +236,7 @@ worker/test/run.mjs      가짜 번역, 가짜 텔레그램으로 하는 내부 
 
 - `cd worker && npm install && npm test`
 - 시험은 내 컴퓨터 안에서만 서버를 켠다 (`wrangler dev`, 로컬 D1).
+- 서버를 두 번 켠다. 처음은 비밀이 `ADMIN_PASSWORD` 하나뿐인 꺼진 상태, 다음은 가짜 기능을 모두 켠 상태.
 - 가짜 모드: `FAKE_TRANSLATE=1`, `FAKE_TELEGRAM=1`, `FAKE_TURNSTILE=1`. 이 스위치들은 주소가 localhost일 때만 듣는다. 실제 배포에서 실수로 켜져도 무시된다.
 - 화면 시험 때는 `?api=http://localhost:8787`로 서버 주소를 바꿀 수 있다. 이것도 화면이 localhost에서 열렸을 때만 된다.
 
@@ -230,6 +252,11 @@ worker/test/run.mjs      가짜 번역, 가짜 텔레그램으로 하는 내부 
   - 관리자 비밀번호 5번 실패 시 15분 잠금, 입장 암호도 같은 규칙 (대화방마다).
   - 서버 주소가 비어 있으면 Message 버튼은 Coming soon 그대로.
   - 장부 표는 서버가 스스로 만든다 (손으로 SQL을 넣지 않아도 된다).
+- 2026-10-05 방향 전환: 최소화 원칙.
+  - 번역, 텔레그램, Turnstile은 비밀 값이 없으면 자동으로 꺼진다. 코드는 남겨두고, 비밀만 넣으면 켜진다.
+  - 지금 필요한 비밀은 `ADMIN_PASSWORD` 하나.
+  - 사람 확인이 꺼진 동안 자동 프로그램 노크는 하루 100개 제한만 막는다. 관리자 로그인 잠금(5번 실패, 15분)은 누구나 걸 수 있으니, 잠기면 15분 기다린다.
+  - 방문자 화면의 번역 안내 문구와 개인정보 안내는 그대로 둔다 (번역을 켤 예정이라서).
 
 ---
 
@@ -241,5 +268,5 @@ worker/test/run.mjs      가짜 번역, 가짜 텔레그램으로 하는 내부 
   - 루트 디렉터리(Root directory): `worker`
   - 배포 명령(Deploy command): `npx wrangler deploy`
 - D1 데이터베이스 이름: `kbook-chat`. 받은 database_id를 `worker/wrangler.toml`에 넣는다.
-- 배포가 끝나면 Worker 주소를 `chat/config.js`의 `apiBase`에, Turnstile 사이트 키를 `turnstileSiteKey`에 넣는다.
+- 배포가 끝나면 Worker 주소를 `chat/config.js`의 `apiBase`에 넣는다. Turnstile을 켤 때 사이트 키를 `turnstileSiteKey`에 넣는다.
 - Turnstile 위젯의 허용 도메인(hostname): `kbookmaster.github.io`

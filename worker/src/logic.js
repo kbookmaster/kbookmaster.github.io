@@ -20,28 +20,35 @@ export function checkMessageText(raw) {
   return text;
 }
 
-// 주인 메시지의 번역 상태: 상대 언어를 모르면 기다리고, 한국어면 번역하지 않는다
-function ownerTrStatus(conv) {
+// 주인 메시지의 번역 상태: 번역이 꺼져 있거나 한국어면 번역하지 않고, 상대 언어를 모르면 기다린다
+function ownerTrStatus(flags, conv) {
+  if (!flags.translate) return 'none';
   if (!conv.lang) return 'waitlang';
   if (isKorean(conv.lang)) return 'none';
   return 'pending';
 }
 
-export async function addVisitorMessage(env, conv, text) {
+// 번역이 꺼져 있으면 번역을 기다리지 않고 원문으로 바로 알린다 (텔레그램도 꺼져 있으면 아무 일도 없다)
+function notifyUntranslated(env, conv, kind, text) {
+  return enqueue(env, messageText({ kind, name: conv.name, conversationId: conv.id, text, off: true }), { conversationId: conv.id });
+}
+
+export async function addVisitorMessage(env, flags, conv, text) {
   const now = Date.now();
   // 3턴 규칙을 한 문장 안에서 확인하고 넣는다 (동시에 두 번 보내도 넘치지 않게)
   const meta = await run(env,
     `INSERT INTO messages (conversation_id, sender, body, tr_status, notify, created_at)
-     SELECT ?1, 'visitor', ?2, 'pending', 'new', ?3
+     SELECT ?1, 'visitor', ?2, ?5, ?6, ?3
      WHERE (${VISITOR_SINCE_REPLY_SQL}) < ?4`,
-    conv.id, text, now, LIMITS.turnsPerReply);
+    conv.id, text, now, LIMITS.turnsPerReply, flags.translate ? 'pending' : 'none', flags.translate ? 'new' : null);
   if (!meta.changes) throw new HttpError(429, 'turn_limit', { max: LIMITS.turnsPerReply });
   await run(env, 'UPDATE conversations SET last_activity_at = ? WHERE id = ?', now, conv.id);
+  if (!flags.translate) await notifyUntranslated(env, conv, 'new', text);
   return meta.last_row_id;
 }
 
-export async function addOwnerMessage(env, conv, text, { fromTelegram = false, createdAt = Date.now() } = {}) {
-  const status = ownerTrStatus(conv);
+export async function addOwnerMessage(env, flags, conv, text, { fromTelegram = false, createdAt = Date.now() } = {}) {
+  const status = ownerTrStatus(flags, conv);
   const notify = fromTelegram ? 'tgconfirm' : null;
   const meta = await run(env,
     'INSERT INTO messages (conversation_id, sender, body, tr_status, notify, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -50,15 +57,17 @@ export async function addOwnerMessage(env, conv, text, { fromTelegram = false, c
   return { id: meta.last_row_id, status };
 }
 
-export async function editMessage(env, conv, msg, text) {
-  const status = msg.sender === 'owner' ? ownerTrStatus(conv) : 'pending';
+export async function editMessage(env, flags, conv, msg, text) {
+  const visitor = msg.sender === 'visitor';
+  const status = visitor ? (flags.translate ? 'pending' : 'none') : ownerTrStatus(flags, conv);
   // 아직 텔레그램에 안 간 새 메시지는 그대로 "새 메시지"로, 이미 간 것은 "수정본"으로 알린다
-  const notifySql = msg.sender === 'visitor' ? "CASE WHEN notify = 'new' THEN 'new' ELSE 'edit' END" : 'notify';
+  const notifySql = visitor && flags.translate ? "CASE WHEN notify = 'new' THEN 'new' ELSE 'edit' END" : 'notify';
   await run(env,
     `UPDATE messages SET body = ?, body_tr = NULL, tr_lang = NULL, tr_status = ?, tr_tries = 0, tr_started = NULL,
        version = version + 1, edited_at = ?, notify = ${notifySql}
      WHERE id = ? AND deleted_at IS NULL`,
     text, status, Date.now(), msg.id);
+  if (visitor && !flags.translate) await notifyUntranslated(env, conv, 'edit', text);
 }
 
 export async function softDeleteMessage(env, msg) {
@@ -79,7 +88,7 @@ export async function createConversation(env, { name, lang = '', passcodeHash = 
 }
 
 // 노크에 초대: 노크 편지가 첫 메시지가 되고, 첫 답장이 있으면 그 뒤에 붙는다
-export async function inviteKnock(env, knock, replyText, { fromTelegram = false } = {}) {
+export async function inviteKnock(env, flags, knock, replyText, { fromTelegram = false } = {}) {
   if (knock.conversation_id) {
     const existing = await first(env, 'SELECT * FROM conversations WHERE id = ?', knock.conversation_id);
     if (existing) throw new HttpError(409, 'already_invited', { conversationId: existing.id });
@@ -90,18 +99,18 @@ export async function inviteKnock(env, knock, replyText, { fromTelegram = false 
     `INSERT INTO messages (conversation_id, sender, body, body_tr, tr_lang, src_lang, tr_status, created_at)
      VALUES (?, 'visitor', ?, ?, ?, ?, ?, ?)`,
     conv.id, knock.letter, translated ? knock.letter_tr : null, translated ? 'ko' : null,
-    knock.lang || null, translated ? 'done' : 'pending', knock.created_at);
+    knock.lang || null, translated ? 'done' : (flags.translate ? 'pending' : 'none'), knock.created_at);
   await run(env, 'UPDATE knocks SET conversation_id = ? WHERE id = ?', conv.id, knock.id);
   let reply = null;
-  if (replyText) reply = await addOwnerMessage(env, conv, replyText, { fromTelegram });
+  if (replyText) reply = await addOwnerMessage(env, flags, conv, replyText, { fromTelegram });
   return { conv, reply };
 }
 
 // 상대 언어가 정해지면, 언어를 몰라서 기다리던 내 메시지들을 번역 줄에 세운다
-export async function setConversationLang(env, conv, lang) {
+export async function setConversationLang(env, flags, conv, lang) {
   if (!lang || lang === conv.lang) return;
   await run(env, 'UPDATE conversations SET lang = ? WHERE id = ?', lang, conv.id);
-  const next = isKorean(lang) ? 'none' : 'pending';
+  const next = isKorean(lang) || !flags.translate ? 'none' : 'pending';
   await run(env,
     `UPDATE messages SET tr_status = ?, tr_tries = 0 WHERE conversation_id = ? AND sender = 'owner' AND tr_status = 'waitlang' AND deleted_at IS NULL`,
     next, conv.id);
@@ -193,7 +202,7 @@ async function processMessage(env, flags, messageId) {
        WHERE id = ? AND version = ? AND deleted_at IS NULL`,
       result.translation, targetCode, result.lang || null, msg.id, msg.version);
     if (!saved.changes) return; // 그사이 고쳐지거나 지워졌다. 새 번역이 다시 돈다.
-    if (fromVisitor && result.lang) await setConversationLang(env, conv, result.lang);
+    if (fromVisitor && result.lang) await setConversationLang(env, flags, conv, result.lang);
   } else if (msg.tr_tries >= TRANSLATION.maxTries) {
     const saved = await run(env, "UPDATE messages SET tr_status = 'failed' WHERE id = ? AND version = ?", msg.id, msg.version);
     if (!saved.changes) return;
@@ -222,6 +231,13 @@ async function processMessage(env, flags, messageId) {
 
 // 밀린 번역과 알림을 처리한다. 메시지를 저장한 직후와 2분마다 불린다.
 export async function processPending(env, flags) {
+  // 번역도 텔레그램도 꺼져 있으면 할 일이 없다
+  if (!flags.translate && !flags.telegram) return;
+  if (!flags.translate) {
+    // 번역 키를 뺀 뒤 남은 번역 대기는 원문 그대로 둔다
+    await run(env, "UPDATE knocks SET tr_status = 'none' WHERE tr_status IN ('pending', 'working')");
+    await run(env, "UPDATE messages SET tr_status = 'none', notify = NULL WHERE tr_status IN ('pending', 'working', 'waitlang')");
+  }
   try {
     const stale = Date.now() - TRANSLATION.staleMs;
     const knocks = await all(env,
@@ -238,6 +254,14 @@ export async function processPending(env, flags) {
   } catch (e) {
     console.error('flushOutbox failed', e.message);
   }
+}
+
+// 번역이 꺼져 있을 때 새 노크를 원문으로 바로 알린다
+export async function notifyKnockNow(env, flags, knockId, ctx) {
+  if (!flags.telegram) return;
+  const knock = await first(env, 'SELECT * FROM knocks WHERE id = ?', knockId);
+  await enqueue(env, knockText({ name: knock.name, letter: knock.letter, lang: knock.lang, off: true, adminUrl: adminUrl(env) }), { knockId });
+  ctx.waitUntil(processPending(env, flags));
 }
 
 // 방문자에게 보여줄 대화방 모습

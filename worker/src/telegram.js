@@ -39,6 +39,8 @@ export async function sendText(env, flags, chatId, text) {
 
 // 주인에게 보낼 알림을 줄 세운다. 답장 연결용으로 대화방이나 노크 번호를 함께 적는다.
 export function enqueue(env, text, { conversationId = null, knockId = null } = {}) {
+  // 텔레그램이 꺼져 있으면 (봇 토큰이 없으면) 쌓지 않는다
+  if (!env.TELEGRAM_BOT_TOKEN) return Promise.resolve();
   const now = Date.now();
   return run(env, 'INSERT INTO outbox (text, conversation_id, knock_id, next_at, created_at) VALUES (?, ?, ?, ?, ?)',
     text, conversationId, knockId, now, now);
@@ -87,20 +89,21 @@ function original(text, lang) {
   return `<i>원문${lang ? ` (${escapeHtml(lang)})` : ''}</i>\n<blockquote expandable>${escapeHtml(text)}</blockquote>`;
 }
 
-function body(translated, text, lang) {
-  // 번역이 원문과 같으면 (한국어로 쓴 경우) 한 번만 보여준다
+function body(translated, text, lang, off) {
+  // 번역이 꺼져 있거나 번역이 원문과 같으면 (한국어로 쓴 경우) 한 번만 보여준다
+  if (off) return quote(text);
   if (!translated) return `<i>번역 실패, 원문만 보냅니다</i>\n${quote(text)}`;
   if (translated === text) return quote(text);
   return `${quote(translated)}\n${original(text, lang)}`;
 }
 
-export function knockText({ name, letter, letterTr, lang, adminUrl }) {
-  return `🚪 <b>새 노크</b>: ${escapeHtml(name)}\n\n${body(letterTr, letter, lang)}\n\n↩️ 이 알림에 답장(reply)하면 초대와 함께 첫 답장으로 보내져요.\n관리 페이지: ${escapeHtml(adminUrl)}`;
+export function knockText({ name, letter, letterTr, lang, adminUrl, off = false }) {
+  return `🚪 <b>새 노크</b>: ${escapeHtml(name)}\n\n${body(letterTr, letter, lang, off)}\n\n↩️ 이 알림에 답장(reply)하면 초대와 함께 첫 답장으로 보내져요.\n관리 페이지: ${escapeHtml(adminUrl)}`;
 }
 
-export function messageText({ kind, name, conversationId, text, translated, lang }) {
+export function messageText({ kind, name, conversationId, text, translated, lang, off = false }) {
   const head = kind === 'edit' ? '✏️ <b>수정된 메시지</b>' : '💬 <b>새 메시지</b>';
-  return `${head}: ${escapeHtml(name)} <i>#${conversationId}</i>\n\n${body(translated, text, lang)}\n\n↩️ 답장(reply)하면 바로 보내져요.`;
+  return `${head}: ${escapeHtml(name)} <i>#${conversationId}</i>\n\n${body(translated, text, lang, off)}\n\n↩️ 답장(reply)하면 바로 보내져요.`;
 }
 
 export function deletedMessageText({ name, conversationId }) {

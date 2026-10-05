@@ -1,24 +1,45 @@
-// 내부 시험: 가짜 번역, 가짜 텔레그램, 가짜 Turnstile로 서버를 내 컴퓨터에서 켜고 흐름 전체를 확인한다.
+// 내부 시험: 서버를 내 컴퓨터에서 켜고 흐름 전체를 확인한다.
+// 1) 꺼진 상태 (비밀은 ADMIN_PASSWORD 하나) 2) 가짜 번역, 가짜 텔레그램, 가짜 Turnstile을 켠 상태
 // 실행: cd worker && npm test
 import { spawn } from 'node:child_process';
-import { copyFileSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
 const PORT = 8787;
 const BASE = `http://localhost:${PORT}`;
 const ORIGIN = 'http://localhost:8000';
 
-if (!existsSync('.dev.vars')) copyFileSync('.dev.vars.example', '.dev.vars');
-rmSync('.wrangler/state', { recursive: true, force: true });
+// 두 번 켠다. 처음에는 비밀이 ADMIN_PASSWORD 하나뿐인 "꺼진" 상태, 다음에는 가짜 기능을 모두 켠 상태.
+const OFF_VARS = 'SITE_URL=http://localhost:8000\nALLOWED_ORIGINS=http://localhost:8000\nADMIN_PASSWORD=test-password\n';
+const ON_VARS = readFileSync('.dev.vars.example', 'utf-8');
 
-const server = spawn('npx', ['wrangler', 'dev', '--port', String(PORT), '--ip', '127.0.0.1', '--test-scheduled'], {
-  stdio: ['ignore', 'pipe', 'pipe'],
-  detached: true,
-  env: { ...process.env, NO_PROXY: 'localhost,127.0.0.1', no_proxy: 'localhost,127.0.0.1' },
-});
+let server = null;
 let log = '';
-server.stdout.on('data', (d) => { log += d; });
-server.stderr.on('data', (d) => { log += d; });
+
+async function startServer(vars) {
+  writeFileSync('.dev.vars', vars);
+  rmSync('.wrangler/state', { recursive: true, force: true });
+  log = '';
+  server = spawn('npx', ['wrangler', 'dev', '--port', String(PORT), '--ip', '127.0.0.1', '--test-scheduled'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+    env: { ...process.env, NO_PROXY: 'localhost,127.0.0.1', no_proxy: 'localhost,127.0.0.1' },
+  });
+  server.stdout.on('data', (d) => { log += d; });
+  server.stderr.on('data', (d) => { log += d; });
+  await waitForServer();
+}
+
+async function stopServer() {
+  if (!server) return;
+  // 서버와 그 자식 프로세스를 함께 끈다
+  try { process.kill(-server.pid, 'SIGTERM'); } catch (e) { server.kill('SIGTERM'); }
+  server = null;
+  for (let i = 0; i < 40; i++) {
+    try { await fetch(`${BASE}/api/health`); } catch (e) { return; }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
 
 async function waitForServer() {
   for (let i = 0; i < 120; i++) {
@@ -55,8 +76,52 @@ async function step(name, fn) {
 }
 
 try {
-  await waitForServer();
-  console.log('server up, running checks');
+  await startServer(OFF_VARS);
+  console.log('off mode: only ADMIN_PASSWORD is set');
+  {
+    const login = await call('POST', '/api/admin/login', { body: { password: 'test-password' } });
+    const admin = { Authorization: 'Bearer ' + login.data.token };
+
+    await step('off: the admin page reports translation, telegram and turnstile as off', async () => {
+      const o = await call('GET', '/api/admin/overview', { headers: admin });
+      assert.deepEqual(o.data.features, { translate: false, telegram: false, turnstile: false });
+    });
+
+    let roomKey;
+    await step('off: a knock is accepted without the human check and shown as the original', async () => {
+      const k = await call('POST', '/api/knock', { body: { name: 'Ana', letter: 'Hola, ¿qué tal?' } });
+      assert.equal(k.status, 200);
+      const o = await call('GET', '/api/admin/overview', { headers: admin });
+      assert.equal(o.data.knocks[0].trStatus, 'none');
+      assert.equal(o.data.knocks[0].translation, null);
+      const inv = await call('POST', `/api/admin/knocks/${o.data.knocks[0].id}/invite`, { headers: admin, body: { reply: '반가워요' } });
+      assert.equal(inv.status, 200);
+      roomKey = inv.data.link.split('#k=')[1];
+    });
+
+    await step('off: both sides see originals, nothing waits for translation', async () => {
+      const r = await call('GET', '/api/room?lang=es', { headers: { 'X-Room-Key': roomKey } });
+      assert.equal(r.data.messages[1].text, '반가워요');
+      assert.equal(r.data.messages[1].translating, undefined);
+      const s = await call('POST', '/api/room/messages', { headers: { 'X-Room-Key': roomKey }, body: { text: 'Gracias' } });
+      assert.equal(s.data.remaining, 2);
+      const o = await call('GET', '/api/admin/overview', { headers: admin });
+      const c = await call('GET', `/api/admin/conversations/${o.data.conversations[0].id}`, { headers: admin });
+      const last = c.data.messages.at(-1);
+      assert.equal(last.body, 'Gracias');
+      assert.equal(last.trStatus, 'none');
+    });
+
+    await step('off: telegram cannot be connected and test-only addresses stay closed', async () => {
+      const t = await call('POST', '/api/admin/telegram/connect', { headers: admin });
+      assert.equal(t.data.error, 'telegram_token_not_set');
+      assert.equal((await call('POST', '/api/dev/process')).status, 404);
+    });
+  }
+  await stopServer();
+
+  await startServer(ON_VARS);
+  console.log('on mode: fake translation, fake telegram, fake turnstile');
 
   let admin;
   let knockToken;
@@ -295,7 +360,6 @@ try {
   console.error('\n--- server log (tail) ---\n' + log.slice(-4000));
   process.exitCode = 1;
 } finally {
-  // 서버와 그 자식 프로세스를 함께 끈다
-  try { process.kill(-server.pid, 'SIGTERM'); } catch (e) { server.kill('SIGTERM'); }
-  setTimeout(() => process.exit(), 500);
+  await stopServer();
+  setTimeout(() => process.exit(), 300);
 }
